@@ -4,19 +4,11 @@
 
 ---
 
-## 📑 Table of Contents
+## 📑 Index
 
-- [🧠 The Core Mental Model](#-the-core-mental-model)
-- [🔌 Fundamental Socket API Breakdown](#-fundamental-socket-api-breakdown)
-- [🗺️ Journey Roadmap & Index](#️-journey-roadmap--index)
-- [📦 Level 1: Basic Single-Message TCP Communication](#-level-1-basic-single-message-tcp-communication)
-  - [Overview](#level-1-overview)
-  - [Architecture & Sequence Wireframe](#level-1-architecture--sequence-wireframe)
-  - [Server Lifecycle Walkthrough](#server-lifecycle-walkthrough)
-  - [Client Lifecycle Walkthrough](#client-lifecycle-walkthrough)
-  - [Crucial Concepts & Data Structures](#crucial-concepts--data-structures)
-  - [How to Compile and Run](#how-to-compile-and-run)
-- [🧭 Next Levels (Upcoming)](#-next-levels-upcoming)
+| Level | Description |
+| :--- | :--- |
+| [Level 1 (`lev1`)](#-level-1-basic-single-message-tcp-communication) | Single-message blocking TCP server & client |
 
 ---
 
@@ -122,18 +114,6 @@ Here is the essential socket lifecycle cheat sheet:
 ### 7. `close()`
 * **What it is:** Closes the socket file descriptor and releases network resources.
 * **Why use it:** Prevents resource leaks (file descriptors and memory) and cleanly initiates the TCP 4-way termination handshake (`FIN` / `ACK`).
-
----
-
-## 🗺️ Journey Roadmap & Index
-
-| Level | Directory | Topic / Focus | Status |
-| :---: | :---: | :--- | :---: |
-| **01** | [`lev1`](file:///g:/cyber/socket/lev1) | Basic Single-Message TCP Server & Client | Completed |
-| **02** | `lev2` | Continuous Communication & Dynamic Loops | Coming Soon |
-| **03** | `lev3` | Multi-Client Handling via Forking / Threads | Planned |
-| **04** | `lev4` | Non-blocking I/O & Multiplexing (`select` / `poll`) | Planned |
-| **05** | `lev5` | Modern High-Performance Event Loops (`epoll` / `kqueue`) | Planned |
 
 ---
 
@@ -289,16 +269,6 @@ gcc -Wall -Wextra -O2 lev1/client.c -o lev1/client
 Client connected!
 Client said: Hello
 ```
-
----
-
-## 🧭 Next Levels (Upcoming)
-
-When you are ready to expand the journey:
-- **Level 2:** Continuous bi-directional conversation loop (keep communicating until `exit` is typed).
-- **Level 3:** Multi-client concurrent server using `fork()` or POSIX threads (`pthreads`).
-- **Level 4:** Multiplexing I/O with `poll()` or `select()` (handling multiple connections in a single thread without blocking).
-- **Level 5:** Scalable event notification with Linux `epoll`.
 
 ---
 
