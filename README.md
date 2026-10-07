@@ -9,6 +9,7 @@
 | Level | Description |
 | :--- | :--- |
 | [Level 1 (`lev1`)](#-level-1-basic-single-message-tcp-communication) | Single-message blocking TCP server & client |
+| [Level 2 (`lev2`)](#-level-2-continuous-bi-directional-echo-session) | Interactive continuous TCP echo loop with error & EOF handling |
 
 ---
 
@@ -269,6 +270,191 @@ gcc -Wall -Wextra -O2 lev1/client.c -o lev1/client
 Client connected!
 Client said: Hello
 ```
+
+---
+
+## 📦 Level 2: Continuous Bi-Directional Echo Session
+
+### Level 2 Overview
+In Level 2, we graduate from a single-shot `"Hello"` message to a **persistent, interactive session**. The client continuously accepts user input from standard input, sends it over the wire, and the server continuously echoes the exact data back until either peer disconnects.
+
+Level 2 introduces critical production fundamentals:
+1. **The Event Loop (`while (1)`)**: Keeps the connection alive for multiple exchanges.
+2. **Defensive Error Handling**: Every socket system call checks for `< 0` and inspects `perror()`.
+3. **TCP Connection Teardown Detection (`recv() == 0`)**: Detecting when the client closes the connection via EOF or termination, allowing clean resource reclamation without crashing.
+
+Files:
+- [`lev2/server.c`](file:///g:/cyber/socket/lev2/server.c)
+- [`lev2/client.c`](file:///g:/cyber/socket/lev2/client.c)
+
+---
+
+### Level 2 Architecture & Sequence Wireframe
+
+```
+[ CLIENT (Terminal 2) ]                                     [ SERVER (Terminal 1) ]
+         |                                                            |
+     socket()                                                      socket()
+         |                                                            |
+         |                                                          bind() -> :8080
+         |                                                            |
+         |                                                         listen()
+         |                                                            |
+     connect() ==============[ TCP 3-Way Handshake ]===============> accept() -> client_fd
+         |                                                            |
+=============================== CONTINUOUS LOOP ===============================
+         |                                                            |
+  fgets(stdin)                                                        |
+  send("ping\n", 5B) ----------------- [ TCP PSH ] -----------------> recv() -> returned 5B
+         |                                                            send("ping\n", 5B)
+  recv() -> returned 5B <------------- [ TCP PSH ] ------------------/
+  printf("Server: ping")                                              |
+         |                                                            |
+  fgets(stdin)                                                        |
+  send("how are you?\n") ------------ [ TCP PSH ] ------------------> recv() -> returned 13B
+         |                                                            send("how are you?\n", 13B)
+  recv() <---------------------------- [ TCP PSH ] ------------------/
+===============================================================================
+         |                                                            |
+   User presses Ctrl+D                                                |
+   (fgets returns NULL)                                               |
+         |                                                            |
+    close(sockfd)                                                     |
+         | ---------------------- [ TCP FIN ] ----------------------> |
+         |                                                         recv() returns 0!
+         |                                                         ("Client disconnected.")
+         |                                                            |
+         |                                                         close(client_fd)
+       exit                                                        close(server_fd)
+```
+
+---
+
+### Server Lifecycle & Key Improvements Walkthrough
+Refer to [`lev2/server.c`](file:///g:/cyber/socket/lev2/server.c):
+
+1. **Defensive System Call Validation:**
+   Every network operation can fail (port already bound, out of file descriptors, invalid permissions). Level 2 guards each call:
+   ```c
+   server_fd = socket(AF_INET, SOCK_STREAM, 0);
+   if (server_fd < 0) { perror("socket"); return 1; }
+
+   if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+       perror("bind"); return 1;
+   }
+   ```
+
+2. **The Connection Lifecycle Loop:**
+   Once `accept()` returns `client_fd`, the server enters an infinite loop waiting for frames:
+   ```c
+   while (1) {
+       int n = recv(client_fd, buffer, sizeof(buffer), 0);
+       ...
+   }
+   ```
+
+3. **Mastering `recv()` Return Codes:**
+   The heart of network I/O state management:
+   ```c
+   if (n == 0) {
+       printf("Client disconnected.\n"); // Orderly TCP FIN received
+       break;
+   }
+   if (n < 0) {
+       perror("recv");                   // Socket read error / reset
+       break;
+   }
+   ```
+
+4. **Symmetric Echo:**
+   The server echoes back the exact number of bytes it received without altering or assuming null-terminated strings:
+   ```c
+   int sent = send(client_fd, buffer, n, 0);
+   ```
+
+---
+
+### Client Lifecycle & Key Improvements Walkthrough
+Refer to [`lev2/client.c`](file:///g:/cyber/socket/lev2/client.c):
+
+1. **Interactive Prompt with `fgets`:**
+   Reads user input directly from the terminal. If the user signals End-Of-File (`Ctrl+D` on Linux/macOS or `Ctrl+Z` on Windows), `fgets` returns `NULL`, triggering a clean break:
+   ```c
+   while (1) {
+       printf("You: ");
+       if (fgets(buffer, sizeof(buffer), stdin) == NULL)
+           break;
+       ...
+   }
+   ```
+
+2. **Dynamic Transmission:**
+   Measures string length from the keyboard buffer and transmits it:
+   ```c
+   int length = strlen(buffer);
+   int sent = send(sockfd, buffer, length, 0);
+   ```
+
+3. **Safe String Null-Termination:**
+   Because TCP transmits raw byte streams without trailing null characters, the client explicitly terminates index `n` before printing:
+   ```c
+   int n = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+   if (n == 0) {
+       printf("Server disconnected.\n");
+       break;
+   }
+   buffer[n] = '\0';
+   printf("Server: %s", buffer);
+   ```
+
+---
+
+### Crucial Concepts & Patterns in Level 2
+
+| Concept | Explanation |
+| :--- | :--- |
+| **`recv() == 0` (EOF)** | Signals that the remote peer initiated an orderly shutdown (sent a TCP `FIN`). It is **not** an error; it is the standard way to detect a closed connection. |
+| **`recv() < 0`** | Indicates an abnormal error occurred (e.g., connection reset `ECONNRESET`, interrupted call `EINTR`). |
+| **`perror()` & `errno`** | Prints a human-readable description of the last error code recorded in the global thread-local `errno` variable by the OS. |
+| **Byte Count Integrity** | Notice `server.c` calls `send(client_fd, buffer, n, 0)` using the return value `n` from `recv()`. Never assume fixed sizes over a dynamic TCP stream. |
+
+---
+
+### How to Compile and Run
+
+#### 1. Compile both source files
+```bash
+gcc -Wall -Wextra -O2 lev2/server.c -o lev2/server
+gcc -Wall -Wextra -O2 lev2/client.c -o lev2/client
+```
+
+#### 2. Start the Server in Terminal 1
+```bash
+./lev2/server
+# Output:
+# Server listening on port 8080...
+```
+
+#### 3. Start the Client in Terminal 2 & Chat Interactively
+```bash
+./lev2/client
+# Output:
+# Connected to server!
+# You: Hello Level 2!
+# Sent 15 bytes
+# Server: Hello Level 2!
+# You: Socket programming in C is awesome.
+# Sent 35 bytes
+# Server: Socket programming in C is awesome.
+```
+
+#### 4. Disconnecting
+Press `Ctrl+D` in Terminal 2 (or `Ctrl+C`).
+- **Client Output:** Exits cleanly.
+- **Server Output:**
+  ```
+  Client disconnected.
+  ```
 
 ---
 
