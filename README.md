@@ -10,6 +10,10 @@
 | :--- | :--- |
 | [Level 1 (`lev1`)](#-level-1-basic-single-message-tcp-communication) | Single-message blocking TCP server & client |
 | [Level 2 (`lev2`)](#-level-2-continuous-bi-directional-echo-session) | Interactive continuous TCP echo loop with error & EOF handling |
+| [Level 3 (`lev3`)](#-level-3-tcp-framing-buffer-management--command-parsing) | Stream framing with newline delimitation & buffer accumulation |
+| [Level 4 (`lev4`)](#-level-4-multi-process-concurrent-server-with-fork) | Concurrent multi-client architecture using process isolation (`fork`) |
+| [Level 5 (`lev5`)](#-level-5-thread-safe-in-memory-key-value-store-pthreads) | Thread-safe concurrent Hash Table with mutex locking (`pthread`) |
+| [Level 6 (`lev6`)](#-level-6-high-performance-event-loop-with-linux-epoll) | Non-blocking I/O event multiplexing with Linux `epoll` |
 
 ---
 
@@ -455,6 +459,388 @@ Press `Ctrl+D` in Terminal 2 (or `Ctrl+C`).
   ```
   Client disconnected.
   ```
+
+---
+
+## 📦 Level 3: TCP Framing, Buffer Management & Command Parsing
+
+### Level 3 Overview
+A critical reality of TCP: **TCP is a byte-stream protocol, not a message protocol**. It guarantees in-order byte delivery, but has zero concept of application-level message boundaries.
+- **Packet Fragmentation:** A single command might arrive in two separate `recv()` calls.
+- **Packet Concatenation (Coalescing):** Multiple commands sent quickly might arrive combined inside a single `recv()` call.
+
+Level 3 solves this by implementing **delimiter-based framing (`\n`)**, persistent buffer accumulation (`buffer_used`), and dynamic memory shifting (`memmove`) to parse protocol commands (`PING` -> `PONG\n`).
+
+Files:
+- [`lev3/server.c`](file:///g:/cyber/socket/lev3/server.c)
+- [`lev3/client.c`](file:///g:/cyber/socket/lev3/client.c)
+
+---
+
+### Level 3 Architecture & Buffer Wireframe
+
+```
+Raw TCP Stream from Network:
++-------------------------------------------------------------+
+| "PING\nPING\nINCOMP" ... (next packet delivers "LETE\n")   |
++-------------------------------------------------------------+
+
+Accumulation Buffer [4096 bytes]:
+Step 1: recv() appends data at (buffer + buffer_used)
++------------------------------------+------------------------+
+| P I N G \n P I N G \n I N C O M P  |       Empty Space      |
++------------------------------------+------------------------+
+ ^          ^
+ |          +--- strchr('\n') finds first message boundary
+ |
+ Dispatches command "PING" -> sends "PONG\n"
+
+Step 2: memmove() shifts remaining unprocessed bytes to the front:
++--------------------------+----------------------------------+
+| P I N G \n I N C O M P   |            Empty Space           |
++--------------------------+----------------------------------+
+             ^
+             +--- Loops again: finds second message boundary!
+```
+
+---
+
+### Server Lifecycle & Buffer Walkthrough
+Refer to [`lev3/server.c`](file:///g:/cyber/socket/lev3/server.c):
+
+1. **Incremental Buffer Offset:**
+   The server reads directly into the unused slice of the buffer:
+   ```c
+   int n = recv(client_fd, buffer + buffer_used, BUFFER_SIZE - buffer_used - 1, 0);
+   buffer_used += n;
+   buffer[buffer_used] = '\0';
+   ```
+
+2. **Scanning for Delimiters:**
+   Using `strchr(buffer, '\n')`, the server searches for complete command terminations:
+   ```c
+   while ((newline = strchr(buffer, '\n')) != NULL) {
+       *newline = '\0'; // Temporarily terminate token
+
+       if (strcmp(buffer, "PING") == 0)
+           send(client_fd, "PONG\n", 5, 0);
+       else
+           send(client_fd, "NOT_IMPLEMENTED\n", 16, 0);
+   ```
+
+3. **Buffer Compaction with `memmove`:**
+   After handling a command, the consumed bytes must be evicted, and leftover bytes shifted to index `0`:
+   ```c
+       int consumed = (newline - buffer) + 1;
+       memmove(buffer, buffer + consumed, buffer_used - consumed);
+       buffer_used -= consumed;
+       buffer[buffer_used] = '\0';
+   }
+   ```
+
+---
+
+### Crucial Concepts in Level 3
+
+| Concept | Explanation |
+| :--- | :--- |
+| **`memmove` vs `memcpy`** | `memmove` safely handles **overlapping memory regions**, which is guaranteed to occur when shifting bytes inside the same buffer array. `memcpy` on overlapping memory causes undefined behavior. |
+| **Frame Boundaries** | Delimiter framing (`\n`, `\r\n`) is simple and human-readable (used in HTTP/1.1, Redis RESP, SMTP). Binary protocols often use **length-prefixed framing** (e.g. 4-byte header specifying payload size). |
+
+---
+
+### How to Compile and Run
+
+```bash
+# Terminal 1:
+gcc -Wall -Wextra -O2 lev3/server.c -o lev3/server
+./lev3/server
+
+# Terminal 2:
+gcc -Wall -Wextra -O2 lev3/client.c -o lev3/client
+./lev3/client
+# > PING
+# Server: PONG
+# > TEST
+# Server: NOT_IMPLEMENTED
+```
+
+---
+
+## 📦 Level 4: Multi-Process Concurrent Server with `fork()`
+
+### Level 4 Overview
+In Levels 1 through 3, the server was **single-client blocking**: while interacting with Client A, the server was stuck in `recv()` and could not `accept()` any connection from Client B.
+
+Level 4 introduces **process-level concurrency** using the POSIX `fork()` system call:
+- The **Parent Process** dedicates 100% of its time to accepting incoming connections in an infinite loop.
+- Upon each connection, it spawns an isolated **Child Process** (`fork()`) dedicated solely to serving that client.
+
+Files:
+- [`lev4/server.c`](file:///g:/cyber/socket/lev4/server.c)
+
+---
+
+### Level 4 Architecture & Process Wireframe
+
+```
+                     +---------------------------------+
+                     |   PARENT PROCESS (pid = 1000)   |
+                     |       Listens on server_fd      |
+                     +----------------+----------------+
+                                      |
+                      accept() returns client_fd (e.g. fd=4)
+                                      |
+                               fork() called
+                               /             \
+                             /                 \
+    +-----------------------+                   +-----------------------+
+    |     PARENT PROCESS    |                   |     CHILD PROCESS     |
+    |      (pid = 1000)     |                   |      (pid = 1001)     |
+    +-----------------------+                   +-----------------------+
+    | close(client_fd)      |                   | close(server_fd)      |
+    | Does NOT need fd=4    |                   | Does NOT need listener|
+    | Loops back to accept()|                   | handle_client(fd=4)   |
+    +-----------------------+                   | exit(0) when finished |
+                                                +-----------------------+
+```
+
+---
+
+### Key Implementations & Mechanics
+Refer to [`lev4/server.c`](file:///g:/cyber/socket/lev4/server.c):
+
+1. **The Concurrency Fork Loop:**
+   ```c
+   while (1) {
+       client_fd = accept(server_fd, NULL, NULL);
+       pid_t pid = fork();
+
+       if (pid == 0) {
+           // CHILD PROCESS:
+           close(server_fd);          // Child doesn't need to listen
+           handle_client(client_fd);
+           exit(0);                   // Child terminates upon client disconnect
+       }
+
+       // PARENT PROCESS:
+       close(client_fd);              // Parent closes duplicate client socket
+   }
+   ```
+
+2. **File Descriptor Reference Counting:**
+   Under Unix, when `fork()` runs, the child receives a duplicate copy of the parent's file descriptor table pointing to the same underlying kernel file objects.
+   - If the parent does **not** call `close(client_fd)`, the kernel ref count stays $\ge 1$, and TCP `FIN` will **never** be sent to the client when the child terminates!
+   - Both parent and child must explicitly close the descriptors they do not use.
+
+---
+
+### How to Compile and Run
+
+```bash
+gcc -Wall -Wextra -O2 lev4/server.c -o lev4/server
+./lev4/server
+```
+Test with multiple concurrent client terminals:
+```bash
+# Terminal 2 (Client 1):
+nc 127.0.0.1 8080
+
+# Terminal 3 (Client 2 - runs simultaneously without waiting!):
+nc 127.0.0.1 8080
+```
+
+---
+
+## 📦 Level 5: Thread-Safe In-Memory Key-Value Store (`pthreads`)
+
+### Level 5 Overview
+While `fork()` provides memory isolation, multi-client servers often require **shared state** (e.g., an in-memory database like Redis or Memcached).
+
+Level 5 designs a custom in-memory Hash Table with bucket chaining, made completely **thread-safe** across concurrent POSIX threads using mutex locks (`pthread_mutex_t`).
+
+Files:
+- [`lev5/server.c`](file:///g:/cyber/socket/lev5/server.c)
+
+---
+
+### Level 5 Architecture & Hash Table Wireframe
+
+```
+ HashTable Struct
++-----------------------------------------------------------------+
+| pthread_mutex_t lock  <--- Guards all concurrent reads/writes   |
+| buckets[16]                                                     |
++-----------------------------------------------------------------+
+    [0] -> NULL
+    [1] -> [ "name": "Priyanshu" ] -> NULL
+    [2] -> [ "role": "admin" ] -> [ "env": "prod" ] -> NULL (Chaining)
+    ...
+    [15]-> NULL
+```
+
+---
+
+### Core Data Structures & Concurrency Mechanics
+Refer to [`lev5/server.c`](file:///g:/cyber/socket/lev5/server.c):
+
+1. **djb2 Hashing Algorithm:**
+   A fast, highly distributed bit-shifting string hash:
+   ```c
+   unsigned int hash(const char *key) {
+       unsigned int hash = 5381;
+       while (*key) {
+           hash = ((hash << 5) + hash) + *key; // hash * 33 + c
+           key++;
+       }
+       return hash % TABLE_SIZE;
+   }
+   ```
+
+2. **Critical Section Synchronization:**
+   Every mutating and lookup operation acquires the mutex before traversing buckets and releases it upon completion:
+   ```c
+   pthread_mutex_lock(&table->lock);
+   // ... safely manipulate buckets, insert / retrieve / delete nodes ...
+   pthread_mutex_unlock(&table->lock);
+   ```
+
+3. **Multi-Threaded Spawning:**
+   Three concurrent threads write and read simultaneously without race conditions or memory corruption:
+   ```c
+   pthread_t thread1, thread2, thread3;
+   pthread_create(&thread1, NULL, worker, &table);
+   pthread_create(&thread2, NULL, worker, &table);
+   pthread_create(&thread3, NULL, worker, &table);
+
+   pthread_join(thread1, NULL);
+   pthread_join(thread2, NULL);
+   pthread_join(thread3, NULL);
+   ```
+
+---
+
+### How to Compile and Run
+
+```bash
+# Must link with -pthread
+gcc -Wall -Wextra -O2 lev5/server.c -o lev5/server -pthread
+./lev5/server
+```
+
+---
+
+## 📦 Level 6: High-Performance Event Loop with Linux `epoll`
+
+### Level 6 Overview
+The **C10K problem**: Spawning 10,000 processes (`fork`) or 10,000 threads consumes gigabytes of stack memory and destroys CPU throughput via context-switching overhead.
+
+Level 6 implements the modern industry standard for high-performance network engines (used by **Nginx, Node.js, and Redis**): **I/O Multiplexing with Linux `epoll`**.
+A single thread monitors hundreds or thousands of non-blocking sockets simultaneously via OS kernel-driven readiness notifications in $O(1)$ time complexity.
+
+Files:
+- [`lev6/server.c`](file:///g:/cyber/socket/lev6/server.c)
+
+---
+
+### Level 6 Architecture & Event Loop Wireframe
+
+```
++-------------------------------------------------------------------------+
+|                              Linux Kernel                               |
+|                                                                         |
+|  [epoll Interest List]              [epoll Ready List]                  |
+|  - server_fd (8080)                 Events available now:               |
+|  - client_fd 4 (idle)               1. server_fd (New incoming client)  |
+|  - client_fd 5 (ready to read!) ==> 2. client_fd 5 (50 bytes ready)     |
++--------------------------------------------|----------------------------+
+                                             |
+                  epoll_wait() awakes with ready events
+                                             v
++-------------------------------------------------------------------------+
+|                  Single-Threaded Application Event Loop                 |
+|                                                                         |
+|  for each event:                                                        |
+|    if (fd == server_fd)  --> Non-blocking accept() until EAGAIN         |
+|    if (fd == client_fd)  --> Non-blocking recv() & immediate send()     |
++-------------------------------------------------------------------------+
+```
+
+---
+
+### Core Mechanics & API Walkthrough
+Refer to [`lev6/server.c`](file:///g:/cyber/socket/lev6/server.c):
+
+1. **Non-Blocking Sockets via `fcntl`:**
+   By default, socket operations block the thread indefinitely. `O_NONBLOCK` ensures system calls return immediately with `EAGAIN` / `EWOULDBLOCK` if no data is pending:
+   ```c
+   int make_nonblocking(int fd) {
+       int flags = fcntl(fd, F_GETFL, 0);
+       return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+   }
+   ```
+
+2. **Epoll Setup (`epoll_create1` & `epoll_ctl`):**
+   ```c
+   epoll_fd = epoll_create1(0);
+
+   event.events = EPOLLIN;
+   event.data.fd = server_fd;
+   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event);
+   ```
+
+3. **Event Loop (`epoll_wait`):**
+   Sleeps efficiently in kernel space until one or more monitored sockets have I/O readiness:
+   ```c
+   while (1) {
+       int n_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+
+       for (int i = 0; i < n_events; i++) {
+           int fd = events[i].data.fd;
+
+           if (fd == server_fd) {
+               // Drain all pending incoming connections
+               while (1) {
+                   int client_fd = accept(server_fd, NULL, NULL);
+                   if (client_fd < 0) break; // EAGAIN
+                   make_nonblocking(client_fd);
+                   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+               }
+           } else {
+               // Client ready to read
+               int bytes = recv(fd, buffer, sizeof(buffer), 0);
+               if (bytes == 0) {
+                   epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                   close(fd);
+               } else {
+                   send(fd, buffer, bytes, 0);
+               }
+           }
+       }
+   }
+   ```
+
+---
+
+### Comparative Architecture Matrix
+
+| Metric / Mechanism | Level 1 & 2 (Iterative) | Level 4 (`fork`) | Level 5 (`pthread`) | Level 6 (`epoll`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Concurrency Model** | Single client only | Process per client | Thread per client / pool | Event multiplexing |
+| **Memory Footprint** | Minimal | High (process image copy) | Medium (thread stack ~2-8MB) | Lowest (single stack) |
+| **Context Switching** | None | High (OS process switch) | Medium (kernel thread switch) | Zero (single-threaded) |
+| **Shared State** | Trivial | Difficult (Shared Memory/IPC) | Easy (Mutex-protected structs) | Trivial (same memory space) |
+| **Connection Capacity** | 1 | 100s | 1,000s | 100,000+ (C10K / C1000K) |
+
+---
+
+### How to Compile and Run
+
+```bash
+# Note: Linux kernel / WSL / Linux environment required for <sys/epoll.h>
+gcc -Wall -Wextra -O2 lev6/server.c -o lev6/server
+./lev6/server
+```
 
 ---
 
