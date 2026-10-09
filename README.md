@@ -14,6 +14,7 @@
 | [Level 4 (`lev4`)](#-level-4-multi-process-concurrent-server-with-fork) | Concurrent multi-client architecture using process isolation (`fork`) |
 | [Level 5 (`lev5`)](#-level-5-thread-safe-in-memory-key-value-store-pthreads) | Thread-safe concurrent Hash Table with mutex locking (`pthread`) |
 | [Level 6 (`lev6`)](#-level-6-high-performance-event-loop-with-linux-epoll) | Non-blocking I/O event multiplexing with Linux `epoll` |
+| [Level 7 (`redis`)](#-level-7-redis-from-scratch--storage-engine-core) | Building Redis: modular in-memory storage engine & hashmap |
 
 ---
 
@@ -840,6 +841,164 @@ Refer to [`lev6/server.c`](file:///g:/cyber/socket/lev6/server.c):
 # Note: Linux kernel / WSL / Linux environment required for <sys/epoll.h>
 gcc -Wall -Wextra -O2 lev6/server.c -o lev6/server
 ./lev6/server
+```
+
+---
+
+## 📦 Level 7: Redis From Scratch — Storage Engine Core
+
+### Level 7 Overview
+In Level 7, we take a major evolutionary leap: shifting from isolated network experiments into building a **production-style, modular in-memory database server** (a Redis clone) in pure C.
+
+Every database server is fundamentally composed of two distinct pillars:
+1. **The Network & Protocol Engine:** (Socket listening, event looping with `epoll`, framing, command parsing).
+2. **The Storage Engine:** An in-memory data store providing sub-millisecond $O(1)$ key lookups, insertions, and deletions.
+
+Level 7 establishes the foundation of the storage engine: a clean, modular **`HashMap`** library with collision chaining, string duplication, key existence checks, and complete heap memory lifecycle management.
+
+Files:
+- [`redis/src/hashmap.h`](file:///g:/cyber/socket/redis/src/hashmap.h) — Header declaring public storage engine API & structures.
+- [`redis/src/hashmap.c`](file:///g:/cyber/socket/redis/src/hashmap.c) — Implementation of hashing, bucket traversal, and memory cleanup.
+- [`redis/Makefile`](file:///g:/cyber/socket/redis/Makefile) — Build automation script.
+
+---
+
+### Level 7 Architecture & Storage Engine Wireframe
+
+```
++-------------------------------------------------------------------------+
+|                        REDIS ARCHITECTURE ROADMAP                       |
+|                                                                         |
+|  [Clients] ===(RESP / TCP)===> [Network I/O: epoll]                     |
+|                                       |                                 |
+|                                [Command Parser]                         |
+|                                       |                                 |
+|                         +-------------v-------------+                   |
+|                         |  STORAGE ENGINE (Level 7) |                   |
+|                         |    SET / GET / DEL / ...  |                   |
+|                         +-------------+-------------+                   |
++---------------------------------------|---------------------------------+
+                                        v
+                            HASHMAP IN-MEMORY LAYOUT
+                    +------------------------------------+
+                    |  HashMap: buckets[1024]            |
+                    +------------------------------------+
+    Bucket Index:
+         [0]    ---> NULL (empty)
+         [1]    ---> NULL
+         ...
+         [42]   ---> +----------------------------+
+                     | key:   "user:101"          |
+                     | value: "Alice"             |
+                     | next:  --------------------+---+
+                     +----------------------------+   | (Collision Chaining)
+                                                      v
+                                           +----------------------------+
+                                           | key:   "token:99"          |
+                                           | value: "xyz_secret"        |
+                                           | next:  NULL                |
+                                           +----------------------------+
+         ...
+        [1023]  ---> NULL
+```
+
+---
+
+### Storage Engine API Walkthrough
+Refer to [`redis/src/hashmap.h`](file:///g:/cyber/socket/redis/src/hashmap.h) & [`redis/src/hashmap.c`](file:///g:/cyber/socket/redis/src/hashmap.c):
+
+1. **The Data Structures:**
+   ```c
+   typedef struct Entry {
+       char *key;
+       char *value;
+       struct Entry *next;
+   } Entry;
+
+   typedef struct {
+       Entry *buckets[HASHMAP_SIZE]; // 1024 buckets
+   } HashMap;
+   ```
+
+2. **The `djb2` Hash Function:**
+   Calculates a uniform distribution hash code across 1024 buckets using bit manipulation:
+   ```c
+   static unsigned long hash(const char *key) {
+       unsigned long hash = 5381;
+       int c;
+       while ((c = *key++)) {
+           hash = ((hash << 5) + hash) + c; // hash * 33 + c
+       }
+       return hash % HASHMAP_SIZE;
+   }
+   ```
+
+3. **`hashmap_set` (Upsert Semantics):**
+   - Hashes `key` to locate the bucket index.
+   - Traverses bucket linked list. If `key` exists, frees the old `value` and replaces it with a new `strdup(value)`.
+   - If not found, allocates a new `Entry`, duplicates both `key` and `value` onto the heap, and prepends it to the head of the bucket.
+
+4. **`hashmap_get` (Safe Retrieval):**
+   ```c
+   char *hashmap_get(HashMap *map, const char *key);
+   ```
+   Finds matching entry and returns `strdup(entry->value)`. Returning a duplicate prevents outside callers from accidentally mutating internal database memory or triggering use-after-free bugs.
+
+5. **`hashmap_delete` & `hashmap_exists`:**
+   - `hashmap_delete`: Traverses the bucket with a `previous` pointer, splices the node out of the linked list, and frees `key`, `value`, and the `Entry` struct. Returns `1` on success, `0` if not found.
+   - `hashmap_exists`: Lightweight $O(1)$ check returning `1` or `0` without copying value memory.
+
+6. **`hashmap_destroy` (Total Heap Reclamation):**
+   Iterates through all 1024 buckets, traversing and freeing every remaining linked node to ensure zero memory leaks when shutting down the database.
+
+---
+
+### Memory Management & Ownership Rules
+
+| Operation | Memory Allocation | Caller Responsibility |
+| :--- | :--- | :--- |
+| `hashmap_set(map, k, v)` | Allocates `Entry`, copies `k` & `v` with `strdup()` | Caller still owns original passed-in strings |
+| `hashmap_get(map, k)` | Allocates fresh string copy with `strdup()` | **Caller must call `free()` on returned pointer** |
+| `hashmap_delete(map, k)` | Deallocates `key`, `value`, and `Entry` node | Memory freed immediately |
+| `hashmap_destroy(map)` | Deallocates all nodes across all buckets | Frees entire database heap footprint |
+
+---
+
+### Example Test Harness & Compilation
+
+To test the storage engine before connecting it to sockets:
+
+```c
+// test.c
+#include "hashmap.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    HashMap db;
+    hashmap_init(&db);
+
+    hashmap_set(&db, "hero", "Batman");
+    hashmap_set(&db, "city", "Gotham");
+
+    char *hero = hashmap_get(&db, "hero");
+    printf("hero: %s\n", hero); // Prints Batman
+    free(hero);
+
+    if (hashmap_exists(&db, "city")) {
+        printf("city exists!\n");
+    }
+
+    hashmap_delete(&db, "hero");
+    hashmap_destroy(&db);
+    return 0;
+}
+```
+
+```bash
+# Compile and test:
+gcc -Wall -Wextra -O2 redis/src/hashmap.c test.c -o test_redis
+./test_redis
 ```
 
 ---
