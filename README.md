@@ -14,7 +14,7 @@
 | [Level 4 (`lev4`)](#-level-4-multi-process-concurrent-server-with-fork) | Concurrent multi-client architecture using process isolation (`fork`) |
 | [Level 5 (`lev5`)](#-level-5-thread-safe-in-memory-key-value-store-pthreads) | Thread-safe concurrent Hash Table with mutex locking (`pthread`) |
 | [Level 6 (`lev6`)](#-level-6-high-performance-event-loop-with-linux-epoll) | Non-blocking I/O event multiplexing with Linux `epoll` |
-| [Level 7 (`redis`)](#-level-7-redis-from-scratch--storage-engine-core) | Building Redis: modular in-memory storage engine & hashmap |
+| [Level 7 (`redis`)](#-level-7-redis-from-scratch--complete-in-memory-database-server) | Building a non-blocking Redis clone: storage engine, protocol parser, epoll event loop & CLI |
 
 ---
 
@@ -845,160 +845,338 @@ gcc -Wall -Wextra -O2 lev6/server.c -o lev6/server
 
 ---
 
-## 📦 Level 7: Redis From Scratch — Storage Engine Core
+## 📦 Level 7: Redis From Scratch — Complete In-Memory Database Server
 
 ### Level 7 Overview
-In Level 7, we take a major evolutionary leap: shifting from isolated network experiments into building a **production-style, modular in-memory database server** (a Redis clone) in pure C.
+In Level 7, our journey culminates in synthesizing all foundational concepts explored across Levels 1 through 6 into a **modular, production-style in-memory database server** (`ctdredis`) and a dedicated terminal client (`ctdredis-cli`).
 
-Every database server is fundamentally composed of two distinct pillars:
-1. **The Network & Protocol Engine:** (Socket listening, event looping with `epoll`, framing, command parsing).
-2. **The Storage Engine:** An in-memory data store providing sub-millisecond $O(1)$ key lookups, insertions, and deletions.
-
-Level 7 establishes the foundation of the storage engine: a clean, modular **`HashMap`** library with collision chaining, string duplication, key existence checks, and complete heap memory lifecycle management.
+Building a high-performance database requires fusing two core pillars:
+1. **The Network & Protocol Engine:** High-capacity non-blocking I/O multiplexing (`epoll` from Level 6), delimiter-based stream framing and buffer compaction (`memmove` from Level 3), safe packet transmission (`send_all`), and command tokenization.
+2. **The Storage Engine:** An in-memory data store providing sub-millisecond $O(1)$ key lookups, insertions, deletions, and existence checks with complete memory lifecycle safety (custom `HashMap` from Level 5/7).
 
 Files:
-- [`redis/src/hashmap.h`](file:///g:/cyber/socket/redis/src/hashmap.h) — Header declaring public storage engine API & structures.
-- [`redis/src/hashmap.c`](file:///g:/cyber/socket/redis/src/hashmap.c) — Implementation of hashing, bucket traversal, and memory cleanup.
-- [`redis/Makefile`](file:///g:/cyber/socket/redis/Makefile) — Build automation script.
+- [`redis/src/server.c`](file:///g:/cyber/socket/redis/src/server.c) — Event-driven database server engine with Linux `epoll`, per-client state buffers, framing, and command execution.
+- [`redis/src/protocol.h`](file:///g:/cyber/socket/redis/src/protocol.h) — Header declaring `Command` struct and command parsing interfaces.
+- [`redis/src/protocol.c`](file:///g:/cyber/socket/redis/src/protocol.c) — Delimiter tokenizer parsing raw text into structured command arguments.
+- [`redis/src/hashmap.h`](file:///g:/cyber/socket/redis/src/hashmap.h) — Header declaring public storage engine API & bucket structures.
+- [`redis/src/hashmap.c`](file:///g:/cyber/socket/redis/src/hashmap.c) — Collision-chained `HashMap` implementation with `djb2` hash and complete heap lifecycle management.
+- [`redis/client/main.c`](file:///g:/cyber/socket/redis/client/main.c) — Interactive REPL client (`ctdredis-cli`) with streaming transmission and response framing.
+- [`redis/Makefile`](file:///g:/cyber/socket/redis/Makefile) — Build automation script for compiling server and client binaries.
+- [`redis/public/`](file:///g:/cyber/socket/redis/public/) — Demo terminal screenshots showing server compilation, startup, and CLI client interactions.
 
 ---
 
-### Level 7 Architecture & Storage Engine Wireframe
+### End-to-End Architecture & Wireframe
 
 ```
-+-------------------------------------------------------------------------+
-|                        REDIS ARCHITECTURE ROADMAP                       |
-|                                                                         |
-|  [Clients] ===(RESP / TCP)===> [Network I/O: epoll]                     |
-|                                       |                                 |
-|                                [Command Parser]                         |
-|                                       |                                 |
-|                         +-------------v-------------+                   |
-|                         |  STORAGE ENGINE (Level 7) |                   |
-|                         |    SET / GET / DEL / ...  |                   |
-|                         +-------------+-------------+                   |
-+---------------------------------------|---------------------------------+
-                                        v
-                            HASHMAP IN-MEMORY LAYOUT
-                    +------------------------------------+
-                    |  HashMap: buckets[1024]            |
-                    +------------------------------------+
-    Bucket Index:
-         [0]    ---> NULL (empty)
-         [1]    ---> NULL
-         ...
-         [42]   ---> +----------------------------+
-                     | key:   "user:101"          |
-                     | value: "Alice"             |
-                     | next:  --------------------+---+
-                     +----------------------------+   | (Collision Chaining)
-                                                      v
-                                           +----------------------------+
-                                           | key:   "token:99"          |
-                                           | value: "xyz_secret"        |
-                                           | next:  NULL                |
-                                           +----------------------------+
-         ...
-        [1023]  ---> NULL
++---------------------------------------------------------------------------------------------------+
+|                                  CTDREDIS SYSTEM ARCHITECTURE                                     |
++---------------------------------------------------------------------------------------------------+
+
+     [ctdredis-cli]              [nc / telnet]             [App Client]
+           |                           |                         |
+           +---------------------------+-------------------------+
+                                       |
+                       TCP Stream over Port 8080 (IPv4)
+                                       |
+                                       v
+                     +-----------------------------------+
+                     |   epoll Event Multiplexer (O(1))  |
+                     |  - server_fd: accept() drain loop |
+                     |  - client_fds: EPOLLIN|EPOLLRDHUP |
+                     +-----------------+-----------------+
+                                       |
+                        Ready client FD wakes up
+                                       |
+                                       v
+         +---------------------------------------------------------------+
+         | Per-Client State Buffer: Client* clients[fd]                  |
+         |                                                               |
+         | [recv() appends to client->buffer + client->used]             |
+         | +-----------------------------------------------------------+ |
+         | | S E T   u s e r   A l i c e \n G E T   u s e r \n ...     | |
+         | +-----------------------------------------------------------+ |
+         +-------------------------------+-------------------------------+
+                                         |
+                       memchr('\n') detects message frame
+                                         |
+                                         v
+         +---------------------------------------------------------------+
+         | Protocol Parser: parse_command()                              |
+         | - Tokenizes line with strtok(" \t\r\n")                       |
+         | - Populates Command { argc, argv[] }                          |
+         +-------------------------------+-------------------------------+
+                                         |
+                                         v
+         +---------------------------------------------------------------+
+         | Command Execution Dispatcher: execute_command()               |
+         | PING | SET | GET | DEL | EXISTS | Invalid                     |
+         +-------------------------------+-------------------------------+
+                                         |
+                                         v
+         +---------------------------------------------------------------+
+         | In-Memory Storage Engine: HashMap (1024 buckets)              |
+         | - djb2 hashing: hash(key) % 1024                              |
+         | - Collision chaining via linked Entry nodes                   |
+         | - String duplication (strdup) for total memory safety         |
+         +-------------------------------+-------------------------------+
+                                         |
+                       Formatted Response Formed
+                                         |
+                                         v
+         +---------------------------------------------------------------+
+         | send_all() Guarantee Loop                                     |
+         | Loops until all bytes are pushed to OS kernel send buffer     |
+         +-------------------------------+-------------------------------+
+                                         |
+         +-------------------------------+-------------------------------+
+         | Buffer Compaction: memmove() shifts leftover stream bytes     |
+         +---------------------------------------------------------------+
 ```
 
 ---
 
-### Storage Engine API Walkthrough
-Refer to [`redis/src/hashmap.h`](file:///g:/cyber/socket/redis/src/hashmap.h) & [`redis/src/hashmap.c`](file:///g:/cyber/socket/redis/src/hashmap.c):
+### Wire Protocol & Supported Command Specifications
 
-1. **The Data Structures:**
-   ```c
-   typedef struct Entry {
-       char *key;
-       char *value;
-       struct Entry *next;
-   } Entry;
+The server communicates via a clean, human-readable, newline-delimited text wire protocol:
 
-   typedef struct {
-       Entry *buckets[HASHMAP_SIZE]; // 1024 buckets
-   } HashMap;
-   ```
-
-2. **The `djb2` Hash Function:**
-   Calculates a uniform distribution hash code across 1024 buckets using bit manipulation:
-   ```c
-   static unsigned long hash(const char *key) {
-       unsigned long hash = 5381;
-       int c;
-       while ((c = *key++)) {
-           hash = ((hash << 5) + hash) + c; // hash * 33 + c
-       }
-       return hash % HASHMAP_SIZE;
-   }
-   ```
-
-3. **`hashmap_set` (Upsert Semantics):**
-   - Hashes `key` to locate the bucket index.
-   - Traverses bucket linked list. If `key` exists, frees the old `value` and replaces it with a new `strdup(value)`.
-   - If not found, allocates a new `Entry`, duplicates both `key` and `value` onto the heap, and prepends it to the head of the bucket.
-
-4. **`hashmap_get` (Safe Retrieval):**
-   ```c
-   char *hashmap_get(HashMap *map, const char *key);
-   ```
-   Finds matching entry and returns `strdup(entry->value)`. Returning a duplicate prevents outside callers from accidentally mutating internal database memory or triggering use-after-free bugs.
-
-5. **`hashmap_delete` & `hashmap_exists`:**
-   - `hashmap_delete`: Traverses the bucket with a `previous` pointer, splices the node out of the linked list, and frees `key`, `value`, and the `Entry` struct. Returns `1` on success, `0` if not found.
-   - `hashmap_exists`: Lightweight $O(1)$ check returning `1` or `0` without copying value memory.
-
-6. **`hashmap_destroy` (Total Heap Reclamation):**
-   Iterates through all 1024 buckets, traversing and freeing every remaining linked node to ensure zero memory leaks when shutting down the database.
+| Command | Arguments | Request Wire Format | Response Format | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `PING` | None | `PING\n` | `PONG\n` | Server liveness probe. |
+| `SET` | `<key> <value>` | `SET <key> <value>\n` | `OK\n` | Stores or updates the key-value mapping (upsert). |
+| `GET` | `<key>` | `GET <key>\n` | `<value>\n` or `(nil)\n` | Retrieves value; returns `(nil)\n` if key is not found. |
+| `DEL` | `<key>` | `DEL <key>\n` | `1\n` or `0\n` | Deletes key; returns `1` if deleted, `0` if non-existent. |
+| `EXISTS` | `<key>` | `EXISTS <key>\n` | `1\n` or `0\n` | Checks key presence without copying value payload. |
+| *Invalid* | Any malformed command | *Any* | `ERR invalid command\n` | Returned if input exceeds max arguments or is empty. |
+| *Unknown* | Unknown command name | *Any* | `ERR unknown command or wrong arguments\n` | Returned if command or argument count is unrecognized. |
 
 ---
 
-### Memory Management & Ownership Rules
+### Component Walkthrough
+
+#### 1. The Storage Engine Core ([`hashmap.h`](file:///g:/cyber/socket/redis/src/hashmap.h) & [`hashmap.c`](file:///g:/cyber/socket/redis/src/hashmap.c))
+
+* **Data Structures:**
+  A fixed-size bucket table where collisions are handled via singly linked node chaining:
+  ```c
+  typedef struct Entry {
+      char *key;
+      char *value;
+      struct Entry *next;
+  } Entry;
+
+  typedef struct {
+      Entry *buckets[HASHMAP_SIZE]; // 1024 buckets
+  } HashMap;
+  ```
+
+* **`djb2` Hashing Algorithm:**
+  Distributes string keys evenly across buckets using bit manipulation:
+  ```c
+  static unsigned long hash(const char *key) {
+      unsigned long hash = 5381;
+      int c;
+      while ((c = *key++)) {
+          hash = ((hash << 5) + hash) + c; // hash * 33 + c
+      }
+      return hash % HASHMAP_SIZE;
+  }
+  ```
+
+* **Operations & Ownership Semantics:**
+  - **`hashmap_set` (Upsert):** Traverses the bucket. If key exists, replaces old value with `strdup(value)`. If absent, allocates a new `Entry`, duplicates `key` and `value` on heap, and prepends to the bucket head.
+  - **`hashmap_get` (Safe Retrieval):** Returns `strdup(entry->value)`. Returning an independent heap copy prevents concurrent or downstream modifications from corrupting internal database state.
+  - **`hashmap_delete` (Removal):** Splices the target node out of the bucket linked list using a trailing `previous` pointer, then frees `key`, `value`, and the `Entry` struct.
+  - **`hashmap_exists` (Presence Check):** Lightweight traversal returning `1` or `0` without any memory allocation.
+  - **`hashmap_destroy` (Teardown):** Traverses all 1024 buckets and frees every allocated node and string, ensuring zero memory leaks upon server shutdown.
+
+##### Memory Management & Ownership Rules
 
 | Operation | Memory Allocation | Caller Responsibility |
 | :--- | :--- | :--- |
-| `hashmap_set(map, k, v)` | Allocates `Entry`, copies `k` & `v` with `strdup()` | Caller still owns original passed-in strings |
-| `hashmap_get(map, k)` | Allocates fresh string copy with `strdup()` | **Caller must call `free()` on returned pointer** |
+| `hashmap_set(map, k, v)` | Allocates `Entry`, copies `k` & `v` with `strdup()` | Caller retains ownership of original input strings |
+| `hashmap_get(map, k)` | Allocates fresh string copy with `strdup()` | **Caller MUST call `free()` on returned pointer** |
 | `hashmap_delete(map, k)` | Deallocates `key`, `value`, and `Entry` node | Memory freed immediately |
 | `hashmap_destroy(map)` | Deallocates all nodes across all buckets | Frees entire database heap footprint |
 
 ---
 
-### Example Test Harness & Compilation
+#### 2. Protocol Parser & Tokenizer ([`protocol.h`](file:///g:/cyber/socket/redis/src/protocol.h) & [`protocol.c`](file:///g:/cyber/socket/redis/src/protocol.c))
 
-To test the storage engine before connecting it to sockets:
+* **Command Representation:**
+  ```c
+  #define COMMAND_MAX_ARGS 3
+  #define COMMAND_MAX_LENGTH 4096
 
-```c
-// test.c
-#include "hashmap.h"
-#include <stdio.h>
-#include <stdlib.h>
+  typedef struct {
+      int argc;
+      char *argv[COMMAND_MAX_ARGS];
+  } Command;
+  ```
 
-int main(void) {
-    HashMap db;
-    hashmap_init(&db);
+* **Tokenization Logic:**
+  `parse_command(char *line, Command *cmd)` utilizes `strtok(line, " \t\r\n")` to extract whitespace-delimited arguments.
+  - If argument count exceeds `COMMAND_MAX_ARGS`, it resets and returns `-1`.
+  - If the line contains no tokens, it returns `-1`.
+  - On success, it populates `cmd->argv` with pointers to in-place null-terminated tokens and returns `0`.
 
-    hashmap_set(&db, "hero", "Batman");
-    hashmap_set(&db, "city", "Gotham");
+---
 
-    char *hero = hashmap_get(&db, "hero");
-    printf("hero: %s\n", hero); // Prints Batman
-    free(hero);
+#### 3. High-Performance Event-Driven Server ([`redis/src/server.c`](file:///g:/cyber/socket/redis/src/server.c))
 
-    if (hashmap_exists(&db, "city")) {
-        printf("city exists!\n");
-    }
+* **Single-Threaded Architecture:**
+  Like real Redis, `ctdredis` runs on a single thread. Because all operations are in-memory with $O(1)$ algorithmic complexity, single-threaded execution eliminates thread locking overhead, race conditions, and context-switching bottlenecks while easily serving thousands of concurrent clients.
 
-    hashmap_delete(&db, "hero");
-    hashmap_destroy(&db);
-    return 0;
-}
+* **Per-Client Connection State (`Client`):**
+  In an asynchronous event loop, clients send partial packets at arbitrary times. Sharing a single global read buffer would cause data corruption between clients. Each connection maintains its own dedicated accumulation buffer:
+  ```c
+  typedef struct {
+      int fd;
+      char buffer[BUFFER_SIZE];
+      size_t used;
+  } Client;
+
+  Client *clients[65536] = {0}; // Indexed directly by file descriptor
+  ```
+
+* **Draining Incoming Connections (Accept Loop):**
+  When `server_fd` has readiness, the server loops `accept()` until `EAGAIN` or `EWOULDBLOCK` to accept all pending handshakes in the kernel queue without waiting for the next epoll tick:
+  ```c
+  while (1) {
+      int client_fd = accept(server_fd, NULL, NULL);
+      if (client_fd < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+          ...
+      }
+      make_nonblocking(client_fd);
+      // Register with epoll: read readiness + hangup detection
+      event.events = EPOLLIN | EPOLLRDHUP;
+      epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
+  }
+  ```
+
+* **Stream Framing & Sliding Buffer Compaction:**
+  As bytes arrive via `recv()`, they append at `client->buffer + client->used`. The server scans for complete newline frames using `memchr()`:
+  ```c
+  while ((newline = memchr(client->buffer, '\n', client->used)) != NULL) {
+      size_t consumed = (size_t)(newline - client->buffer) + 1;
+      *newline = '\0'; // Null-terminate command string
+
+      execute_command(fd, client->buffer);
+
+      // Evict consumed command and slide remaining stream forward
+      memmove(client->buffer, client->buffer + consumed, client->used - consumed);
+      client->used -= consumed;
+      client->buffer[client->used] = '\0';
+  }
+  ```
+
+* **Guaranteed Complete Writes (`send_all`):**
+  TCP kernel send buffers can become full, causing `send()` to transmit fewer bytes than requested (short writes). `send_all` guarantees complete transmission:
+  ```c
+  static int send_all(int fd, const char *data, size_t length) {
+      size_t sent = 0;
+      while (sent < length) {
+          ssize_t n = send(fd, data + sent, length - sent, 0);
+          if (n > 0) sent += (size_t)n;
+          else if (n < 0 && errno == EINTR) continue;
+          else return -1;
+      }
+      return 0;
+  }
+  ```
+
+* **Disconnection & Teardown:**
+  When a client disconnects (`recv() == 0`, `EPOLLRDHUP`, or error), the server unregisters the FD from epoll via `EPOLL_CTL_DEL`, closes the socket, frees the `Client` heap allocation, and clears the lookup entry.
+
+---
+
+#### 4. The Interactive CLI Client ([`redis/client/main.c`](file:///g:/cyber/socket/redis/client/main.c))
+
+* **User REPL Experience:**
+  Connects to `127.0.0.1:8080`, prints an interactive prompt (`> `), and reads commands from standard input.
+* **Stream Transmission Loop:**
+  Ensures the complete input line is delivered to the server using a loop over `send()`.
+* **Framed Response Reader:**
+  Because TCP does not preserve message boundaries, the client reads bytes sequentially into its response buffer until encountering the terminating newline character (`\n`), ensuring exact 1:1 command-to-response display.
+
+---
+
+### Crucial Systems Engineering Concepts in Level 7
+
+| Concept | Challenge | Solution in `ctdredis` |
+| :--- | :--- | :--- |
+| **Connection Multiplexing** | Blocking threads per connection doesn't scale to thousands of clients. | Linux `epoll` monitors up to thousands of non-blocking sockets in $O(1)$ time complexity on a single thread. |
+| **Stream Boundary Fragmentation** | A command like `SET key value\n` may arrive split across multiple TCP segments. | Per-client buffer accumulation (`client->used`) and delimiter extraction with `memchr('\n')`. |
+| **Command Coalescing** | Multiple pipelined commands (e.g. `PING\nPING\n`) may arrive in a single `recv()` call. | Inner `while` loop extracts all ready lines and slides unprocessed bytes with `memmove()`. |
+| **Short Writes** | `send()` can return having written fewer bytes than requested when kernel buffers fill. | Dedicated `send_all()` helper loops until `sent == length`. |
+| **Half-Open / Dead Sockets** | Clients may terminate abruptly without sending data. | Subscribed to `EPOLLRDHUP`, `EPOLLERR`, and `EPOLLHUP` for proactive teardown. |
+| **Buffer Overflow Protection** | Malicious or runaway clients sending infinite bytes without a newline. | Guard check: if `client->used == BUFFER_SIZE - 1`, the server forcefully closes the connection. |
+
+---
+
+### How to Compile, Build, and Run
+
+#### 1. Build Server and Client using `Makefile`
+From the `redis/` directory:
+```bash
+cd redis
+
+# Compile the database server (ctdredis)
+make
+
+# Compile the CLI client (ctdredis-cli)
+make client
 ```
 
+#### 2. Start the Server in Terminal 1
 ```bash
-# Compile and test:
-gcc -Wall -Wextra -O2 redis/src/hashmap.c test.c -o test_redis
-./test_redis
+./ctdredis
+# Output:
+# CTRedis listening on port 8080
+```
+
+![CTRedis Server Output](redis/public/2.png)
+
+#### 3. Connect and Execute Commands in Terminal 2
+Launch the CLI client:
+```bash
+./ctdredis-cli
+# Output:
+# > PING
+# PONG
+# > SET hero Batman
+# OK
+# > GET hero
+# Batman
+# > EXISTS hero
+# 1
+# > DEL hero
+# 1
+# > GET hero
+# (nil)
+# > EXISTS hero
+# 0
+```
+
+![CTRedis CLI Client Session](redis/public/1.png)
+
+#### 4. Concurrency Test with Netcat (`nc`) in Terminal 3
+While the CLI client remains open in Terminal 2, open a third terminal and connect simultaneously:
+```bash
+nc 127.0.0.1 8080
+PING
+# Output: PONG
+SET team "Justice League"
+# Output: OK
+GET team
+# Output: Justice League
+```
+Both clients communicate concurrently without blocking each other, driven entirely by the non-blocking `epoll` event loop!
+
+#### 5. Clean Build Artifacts
+```bash
+make clean
 ```
 
 ---
